@@ -16,6 +16,7 @@ import { ConfigPolicyPlugin } from "@opencode/core/config/plugin/policy"
 import { ConfigProviderPlugin } from "@opencode/core/config/plugin/provider"
 import { ConfigWebSearchPlugin } from "@opencode/core/config/plugin/websearch"
 import { Credential } from "@opencode/core/credential"
+import { InstructionDiscovery } from "@opencode/core/instruction-discovery"
 import { Integration } from "@opencode/core/integration"
 import { Model } from "@opencode/core/model"
 import { ModelResolver } from "@opencode/core/model-resolver"
@@ -121,6 +122,77 @@ function consoleServer(orgID: string | null | undefined, unavailable = false) {
   })
   return { server, config, requests, agents }
 }
+
+// A Console serving workspace instructions and skills from their own endpoints. As Console does, it tags each list with
+// an ETag and answers a request that already holds the current list with a bodyless 304.
+function extensionsConsole() {
+  const state: {
+    config: number | "sso"
+    policies: ConfigPolicy.Info[]
+    instructions: { id: string; name: string; content: string }[]
+    skills: { slug: string; version: string }[]
+    bundles: Record<string, typeof skillBundle>
+    lists: Record<"instructions" | "skills", number | "sso">
+  } = {
+    config: 200,
+    policies: [],
+    instructions: [{ id: "ins_style", name: "Style", content: "Use tabs." }],
+    skills: [{ slug: "deploy", version: "skl_deploy:1" }],
+    bundles: { deploy: skillBundle },
+    lists: { instructions: 200, skills: 200 },
+  }
+  const requests: { path: string; etag: string | null; status: number }[] = []
+  const list = (request: Request, answer: number | "sso", body: unknown) => {
+    if (answer === "sso")
+      return Response.json({ _tag: "SsoRequired", orgId: "org_acme", connectionId: "ssoconn" }, { status: 403 })
+    if (answer === 403)
+      return Response.json({ _tag: "Forbidden", message: "Missing scope skills:use" }, { status: 403 })
+    if (answer !== 200) return new Response("unavailable", { status: answer })
+    const text = JSON.stringify(body)
+    const etag = `"${Bun.hash(text).toString(16)}"`
+    if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: { etag } })
+    return new Response(text, { headers: { "content-type": "application/json", etag } })
+  }
+  const route = (request: Request) => {
+    const path = new URL(request.url).pathname
+    if (path === "/api/v2/config")
+      return state.config === 200
+        ? Response.json({ providers: {}, policies: state.policies })
+        : list(request, state.config, undefined)
+    if (path === "/api/v2/instructions")
+      return list(request, state.lists.instructions, { instructions: state.instructions })
+    if (path === "/api/v2/skills") return list(request, state.lists.skills, { skills: state.skills })
+    const bundle = path.startsWith("/api/v2/skills/") ? state.bundles[path.slice("/api/v2/skills/".length)] : undefined
+    if (bundle) return Response.json(bundle)
+    return new Response("Not found", { status: 404 })
+  }
+  return {
+    state,
+    requests,
+    fetch: (request: Request) => {
+      const response = route(request)
+      requests.push({
+        path: new URL(request.url).pathname,
+        etag: request.headers.get("if-none-match"),
+        status: response.status,
+      })
+      return response
+    },
+  }
+}
+
+const consoleInstructions = (discovery: InstructionDiscovery.Interface) =>
+  discovery
+    .list()
+    .pipe(
+      Effect.map((files) =>
+        Array.isArray(files)
+          ? files.filter((file) => file.path.startsWith("OpenCode Console instruction")).map((file) => file.content)
+          : [],
+      ),
+    )
+const consoleSkills = (skills: Skill.Interface) =>
+  skills.list().pipe(Effect.map((list) => list.filter((skill) => Skill.isUri(skill.path))))
 
 function required<T>(value: T | undefined): T {
   if (value === undefined) throw new Error("Expected value")
@@ -358,9 +430,13 @@ describe("OpencodePlugin", () => {
                   label: initial.label,
                 }),
               ).toEqual(stored.value)
-              expect(requests).toEqual(["/auth/device/token", "/api/v2/config"])
-              // The refresh and the config fetch both say which OpenCode is asking.
-              expect(agents).toEqual(["opencode/beta/1.2.3/test", "opencode/beta/1.2.3/test"])
+              // Instructions and skills are asked for together once the config loads.
+              expect(requests.slice(0, 2)).toEqual(["/auth/device/token", "/api/v2/config"])
+              expect(requests.slice(2).toSorted()).toEqual(
+                scenario.orgID === "org-missing" ? [] : ["/api/v2/instructions", "/api/v2/skills"],
+              )
+              // The refresh and every Console fetch say which OpenCode is asking.
+              expect(agents).toEqual(requests.map(() => "opencode/beta/1.2.3/test"))
             }).pipe(Effect.provideService(App.Metadata, App.make({ name: "test", version: "1.2.3", channel: "beta" }))),
           ({ server }) => Effect.promise(() => server.stop(true)),
         ),
@@ -412,6 +488,7 @@ describe("OpencodePlugin", () => {
             fetch: (request) => {
               authorization.push(request.headers.get("authorization"))
               requests.push(`${request.method} ${new URL(request.url).pathname}`)
+              if (new URL(request.url).pathname !== "/api/v2/config") return new Response(null, { status: 404 })
               const origin = new URL(request.url).origin
               return Response.json({
                 providers: {
@@ -503,9 +580,10 @@ describe("OpencodePlugin", () => {
             }),
           })
 
+          const fetches = ["GET /api/v2/config", "GET /api/v2/instructions", "GET /api/v2/skills"]
           yield* addPlugin()
-          expect(authorization).toEqual(["Bearer secret"])
-          expect(requests).toEqual(["GET /api/v2/config"])
+          expect(authorization).toEqual(["Bearer secret", "Bearer secret", "Bearer secret"])
+          expect(requests.toSorted()).toEqual(fetches)
 
           const provider = required(yield* providers.get(Provider.ID.make("remote")))
           expect(provider).toMatchObject({
@@ -566,7 +644,7 @@ describe("OpencodePlugin", () => {
 
           yield* credentials.update(initial.id, { label: "Renamed" })
           yield* Effect.yieldNow
-          expect(authorization).toEqual(["Bearer secret"])
+          expect(authorization).toHaveLength(3)
 
           const replacement = yield* credentials.create({
             integrationID: Integration.ID.make("opencode"),
@@ -578,14 +656,14 @@ describe("OpencodePlugin", () => {
           })
           yield* eventually(
             Effect.sync(() => authorization.length),
-            (count) => count === 2,
+            (count) => count === 6,
           )
-          expect(authorization).toEqual(["Bearer secret", "Bearer replacement"])
-          expect(requests).toEqual(["GET /api/v2/config", "GET /api/v2/config"])
+          expect(authorization.slice(3)).toEqual(["Bearer replacement", "Bearer replacement", "Bearer replacement"])
+          expect(requests.slice(3).toSorted()).toEqual(fetches)
 
           yield* credentials.remove(initial.id)
           yield* Effect.yieldNow
-          expect(authorization).toEqual(["Bearer secret", "Bearer replacement"])
+          expect(authorization).toHaveLength(6)
           expect((yield* credentials.list(Integration.ID.make("opencode"))).at(-1)?.id).toBe(replacement.id)
         }),
       ({ server }) => Effect.promise(() => server.stop(true)),
@@ -695,7 +773,8 @@ describe("OpencodePlugin", () => {
         const state = { advertised: false, failing: false, requests: 0 }
         const server = Bun.serve({
           port: 0,
-          fetch: () => {
+          fetch: (request) => {
+            if (new URL(request.url).pathname !== "/api/v2/config") return new Response(null, { status: 404 })
             state.requests++
             if (state.failing) return new Response("Unavailable", { status: 502 })
             return Response.json({
@@ -896,7 +975,8 @@ describe("OpencodePlugin", () => {
         const state = { sso: false, requests: 0 }
         const server = Bun.serve({
           port: 0,
-          fetch: () => {
+          fetch: (request) => {
+            if (new URL(request.url).pathname !== "/api/v2/config") return new Response(null, { status: 404 })
             state.requests++
             if (state.sso)
               return Response.json(
@@ -1191,6 +1271,7 @@ describe("OpencodePlugin", () => {
           port: 0,
           fetch: async (request) => {
             const path = new URL(request.url).pathname
+            if (path === "/api/v2/instructions" || path === "/api/v2/skills") return new Response(null, { status: 404 })
             const body = request.method === "POST" ? await request.json() : undefined
             requests.push({
               method: request.method,
@@ -1348,13 +1429,15 @@ describe("OpencodePlugin", () => {
         Bun.serve({
           port: 0,
           fetch: (request) => {
-            if (new URL(request.url).pathname === "/console/api/v2/config") {
+            const path = new URL(request.url).pathname
+            if (path === "/console/api/v2/config") {
               return Response.json({
                 providers: {},
                 websearch: { provider: "opencode" },
               })
             }
-            return Response.json({ providerID: "opencode", results: [] })
+            if (path === "/console/api/websearch") return Response.json({ providerID: "opencode", results: [] })
+            return new Response(null, { status: 404 })
           },
         }),
       ),
@@ -1383,8 +1466,10 @@ describe("OpencodePlugin", () => {
           expect(yield* websearch.query({ query: "default Console", providerID: consoleSearch.id })).toEqual(
             new WebSearch.Response({ providerID: WebSearch.ID.make("opencode"), results: [] }),
           )
-          expect(requests).toEqual([
+          expect(requests.toSorted()).toEqual([
             "https://opencode.ai/console/api/v2/config",
+            "https://opencode.ai/console/api/v2/instructions",
+            "https://opencode.ai/console/api/v2/skills",
             "https://opencode.ai/console/api/websearch",
           ])
         }),
@@ -1525,6 +1610,8 @@ describe("OpencodePlugin", () => {
             if (url.pathname === "/api/v2/config") {
               return Response.json({ providers: {}, websearch: { provider: "opencode" } })
             }
+            if (url.pathname !== "/api/websearch" && url.pathname !== "/loop")
+              return new Response(null, { status: 404 })
             return Response.redirect(`${url.origin}/loop`, 302)
           },
         })
@@ -1568,10 +1655,10 @@ describe("OpencodePlugin", () => {
               authorization: request.headers.get("authorization"),
               orgID: request.headers.get("x-org-id"),
             })
-            if (url.pathname === "/api/v2/config") {
-              return Response.json({ providers: {}, library: { skills: [{ slug: "deploy", version: "1" }] } })
-            }
-            if (url.pathname === "/api/v2/library/skills/deploy") {
+            if (url.pathname === "/api/v2/config") return Response.json({ providers: {} })
+            if (url.pathname === "/api/v2/instructions") return new Response(null, { status: 404 })
+            if (url.pathname === "/api/v2/skills") return Response.json({ skills: [{ slug: "deploy", version: "1" }] })
+            if (url.pathname === "/api/v2/skills/deploy") {
               // Skill archives come from presigned storage on its own host, where the signature covers the encoding.
               const target = new URL("/archive/deploy.json?expires=1&sig=a%20b~c", url)
               target.hostname = "127.0.0.1"
@@ -1598,7 +1685,7 @@ describe("OpencodePlugin", () => {
 
           yield* eventually(skills.list(), (list) => list.some((skill) => skill.id === Skill.ID.make("deploy")))
           expect(downloads).toContainEqual({
-            path: "/api/v2/library/skills/deploy",
+            path: "/api/v2/skills/deploy",
             search: "",
             authorization: "Bearer secret",
             orgID: "org_test",
@@ -1623,10 +1710,10 @@ describe("OpencodePlugin", () => {
           fetch: (request) => {
             const url = new URL(request.url)
             downloads.push({ path: url.pathname, authorization: request.headers.get("authorization") })
-            if (url.pathname === "/api/v2/config") {
-              return Response.json({ providers: {}, library: { skills: [{ slug: "deploy", version: "1" }] } })
-            }
-            if (url.pathname === "/api/v2/library/skills/deploy")
+            if (url.pathname === "/api/v2/config") return Response.json({ providers: {} })
+            if (url.pathname === "/api/v2/instructions") return new Response(null, { status: 404 })
+            if (url.pathname === "/api/v2/skills") return Response.json({ skills: [{ slug: "deploy", version: "1" }] })
+            if (url.pathname === "/api/v2/skills/deploy")
               return Response.redirect(`${url.origin}/assets/deploy.json`, 302)
             return Response.json(skillBundle)
           },
@@ -1668,6 +1755,7 @@ describe("OpencodePlugin", () => {
                 websearch: { provider: "opencode" },
               })
             }
+            if (url.pathname !== "/api/websearch") return new Response(null, { status: 404 })
             return new Response(
               new ReadableStream({
                 start(controller) {
@@ -2369,6 +2457,243 @@ describe("OpencodePlugin with a Console config", () => {
         }),
       (server) => Effect.promise(() => server.stop(true)),
     ),
+  )
+})
+
+describe("OpencodePlugin with Console instructions and skills", () => {
+  const signIn = Effect.fn(function* () {
+    const credentials = yield* Credential.Service
+    return yield* credentials.create({
+      integrationID: Integration.ID.make("opencode"),
+      value: Credential.Key.make({
+        type: "key",
+        key: "secret",
+        metadata: { server: "https://console.test", orgID: "org_acme", orgName: "Acme" },
+      }),
+    })
+  })
+  const downloads = (requests: { path: string }[]) =>
+    requests.filter((request) => request.path === "/api/v2/skills/deploy").length
+
+  it.effect("loads them from their own endpoints and revalidates them with ETags each minute", () =>
+    Effect.gen(function* () {
+      const fake = extensionsConsole()
+      const discovery = yield* InstructionDiscovery.Service
+      const skills = yield* Skill.Service
+      const rebuilds = { instructions: 0, skills: 0 }
+      yield* discovery.transform(() => {
+        rebuilds.instructions++
+      })
+      yield* skills.transform(() => {
+        rebuilds.skills++
+      })
+      yield* signIn()
+      yield* addPlugin().pipe(inProcess(fake))
+      yield* drain
+
+      expect(yield* consoleInstructions(discovery)).toEqual(["Use tabs."])
+      const deploy = required((yield* consoleSkills(skills)).find((skill) => skill.id === Skill.ID.make("deploy")))
+      expect(deploy).toMatchObject({ description: "Deploys the service.", path: "skill://deploy/SKILL.md" })
+      expect(downloads(fake.requests)).toBe(1)
+      const initial = { ...rebuilds }
+
+      // Unchanged lists come back as bodyless 304s, which neither rebuild nor download anything.
+      const polled = fake.requests.length
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(
+        fake.requests
+          .slice(polled)
+          .filter((request) => request.path !== "/api/v2/config")
+          .toSorted((a, b) => a.path.localeCompare(b.path)),
+      ).toEqual([
+        { path: "/api/v2/instructions", etag: expect.stringMatching(/^".+"$/), status: 304 },
+        { path: "/api/v2/skills", etag: expect.stringMatching(/^".+"$/), status: 304 },
+      ])
+      expect(rebuilds).toEqual(initial)
+      expect(downloads(fake.requests)).toBe(1)
+      expect(yield* consoleInstructions(discovery)).toEqual(["Use tabs."])
+      expect((yield* consoleSkills(skills)).map((skill) => skill.id)).toEqual([Skill.ID.make("deploy")])
+
+      // A new skill version downloads again; an edited instruction replaces the old one.
+      fake.state.instructions = [{ id: "ins_style", name: "Style", content: "Use spaces." }]
+      fake.state.skills = [{ slug: "deploy", version: "skl_deploy:2" }]
+      fake.state.bundles.deploy = {
+        slug: "deploy",
+        files: [{ path: "SKILL.md", content: "---\nname: Deploy\ndescription: Deploys it again.\n---\n" }],
+      }
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* consoleInstructions(discovery)).toEqual(["Use spaces."])
+      expect(downloads(fake.requests)).toBe(2)
+      expect((yield* consoleSkills(skills)).map((skill) => skill.description)).toEqual(["Deploys it again."])
+
+      fake.state.skills = []
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* consoleSkills(skills)).toEqual([])
+      expect(downloads(fake.requests)).toBe(2)
+    }),
+  )
+
+  it.effect("treats a 404 or a non-SSO 403 as none, and keeps the last lists while they fail", () =>
+    Effect.gen(function* () {
+      const fake = extensionsConsole()
+      const config = yield* Config.Service
+      const discovery = yield* InstructionDiscovery.Service
+      const skills = yield* Skill.Service
+      const deny: ConfigPolicy.Info = { action: "tool.use", resource: "shell:*", effect: "deny" }
+      const sudo: ConfigPolicy.Info = { action: "tool.use", resource: "shell:sudo *", effect: "deny" }
+      const loaded = Effect.all([consoleInstructions(discovery), consoleSkills(skills)]).pipe(
+        Effect.map(([instructions, skills]) => ({ instructions, skills: skills.map((skill) => skill.id) })),
+      )
+      const everything = { instructions: ["Use tabs."], skills: [Skill.ID.make("deploy")] }
+
+      // Lists that fail before ever loading count as none, without holding back the config's policies.
+      fake.state.lists = { instructions: "sso", skills: "sso" }
+      fake.state.policies = [deny]
+      yield* signIn()
+      yield* addPlugin().pipe(inProcess(fake))
+      yield* drain
+      expect(yield* consolePolicies(config)).toEqual([deny])
+      expect(yield* loaded).toEqual({ instructions: [], skills: [] })
+
+      fake.state.lists = { instructions: 200, skills: 200 }
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* loaded).toEqual(everything)
+
+      // An outage of the lists keeps them, and a config change still lands once their retries give up.
+      fake.state.lists = { instructions: 503, skills: 503 }
+      fake.state.policies = [sudo]
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      // Past the 3 retries.
+      yield* TestClock.adjust("10 seconds")
+      yield* drain
+      expect(yield* consolePolicies(config)).toEqual([sudo])
+      expect(yield* loaded).toEqual(everything)
+
+      // So does a config the Console refuses until the member signs in with SSO again.
+      fake.state.config = "sso"
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* consolePolicies(config)).toEqual([sudo])
+      expect(yield* loaded).toEqual(everything)
+      fake.state.config = 200
+
+      // Lists refused for a missing SSO sign-in are kept too.
+      fake.state.lists = { instructions: "sso", skills: "sso" }
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* loaded).toEqual(everything)
+
+      // A workspace without them answers 404, and an API key without `skills:use` a plain 403: neither is retried.
+      fake.state.lists = { instructions: 404, skills: 403 }
+      const polled = fake.requests.length
+      yield* TestClock.adjust("1 minute")
+      yield* drain
+      expect(yield* loaded).toEqual({ instructions: [], skills: [] })
+      expect(
+        fake.requests
+          .slice(polled)
+          .map((request) => request.path)
+          .toSorted(),
+      ).toEqual(["/api/v2/config", "/api/v2/instructions", "/api/v2/skills"])
+    }),
+  )
+
+  it.effect("withholds them when managed policy denies the Console integration", () =>
+    Effect.gen(function* () {
+      const fake = extensionsConsole()
+      const config = yield* Config.Service
+      const discovery = yield* InstructionDiscovery.Service
+      const skills = yield* Skill.Service
+      const deny: ConfigPolicy.Info = { action: "tool.use", resource: "shell:*", effect: "deny" }
+      fake.state.policies = [deny]
+      yield* signIn()
+      // As config does under managed `integration.use: deny`, it layers only the document's policies.
+      yield* addPlugin().pipe(
+        inProcess(fake),
+        Effect.provideService(Config.Service, {
+          ...config,
+          integration: (integrationID, document) =>
+            config.integration?.(
+              integrationID,
+              document &&
+                new ConfigIntegration.Document({ ...document, info: new Info({ policies: document.info.policies }) }),
+            ) ?? Effect.void,
+        }),
+      )
+      yield* drain
+
+      expect(yield* consolePolicies(config)).toEqual([deny])
+      expect(yield* consoleInstructions(discovery)).toEqual([])
+      expect(yield* consoleSkills(skills)).toEqual([])
+      expect(downloads(fake.requests)).toBe(0)
+    }),
+  )
+
+  it.effect("replaces them on an account switch and clears them on sign-out", () =>
+    Effect.gen(function* () {
+      const credentials = yield* Credential.Service
+      const discovery = yield* InstructionDiscovery.Service
+      const skills = yield* Skill.Service
+      // Holds beta's skill download until the test has looked at the moment right after the switch.
+      const download = Promise.withResolvers<void>()
+      const fake = {
+        fetch: async (request: Request) => {
+          const orgID = request.headers.get("x-org-id") ?? "none"
+          const path = new URL(request.url).pathname
+          if (path === "/api/v2/config") return Response.json({ providers: {} })
+          if (path === "/api/v2/instructions")
+            return Response.json({ instructions: [{ id: orgID, name: orgID, content: `Follow ${orgID}'s rules.` }] })
+          if (path === "/api/v2/skills") return Response.json({ skills: [{ slug: orgID, version: "1" }] })
+          if (path === "/api/v2/skills/beta") await download.promise
+          if (path === `/api/v2/skills/${orgID}`)
+            return Response.json({
+              slug: orgID,
+              files: [{ path: "SKILL.md", content: `---\nname: ${orgID}\ndescription: ${orgID} skill.\n---\n` }],
+            })
+          return new Response("Not found", { status: 404 })
+        },
+      }
+      const account = (orgID: string) =>
+        credentials.create({
+          integrationID: Integration.ID.make("opencode"),
+          value: Credential.Key.make({
+            type: "key",
+            key: orgID,
+            metadata: { server: "https://console.test", orgID, orgName: orgID },
+          }),
+        })
+      const loaded = Effect.all([consoleInstructions(discovery), consoleSkills(skills)]).pipe(
+        Effect.map(([instructions, skills]) => ({ instructions, skills: skills.map((skill) => String(skill.id)) })),
+      )
+      const expected = (orgID: string) => ({ instructions: [`Follow ${orgID}'s rules.`], skills: [orgID] })
+
+      const alpha = yield* account("alpha")
+      yield* addPlugin().pipe(inProcess(fake))
+      expect(yield* eventually(loaded, (value) => value.skills.length > 0)).toEqual(expected("alpha"))
+
+      const beta = yield* account("beta")
+      // Alpha's skill is hidden as soon as the switch lands, before beta's finishes downloading.
+      expect(yield* eventually(loaded, (value) => value.instructions[0] === expected("beta").instructions[0])).toEqual({
+        ...expected("beta"),
+        skills: [],
+      })
+      download.resolve()
+      expect(yield* eventually(loaded, (value) => value.skills.length > 0)).toEqual(expected("beta"))
+
+      yield* credentials.remove(beta.id)
+      expect(yield* eventually(loaded, (value) => value.skills[0] === "alpha")).toEqual(expected("alpha"))
+
+      yield* credentials.remove(alpha.id)
+      expect(yield* eventually(loaded, (value) => value.instructions.length === 0)).toEqual({
+        instructions: [],
+        skills: [],
+      })
+    }),
   )
 })
 

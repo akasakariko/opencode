@@ -58,21 +58,21 @@ const SsoRequired = Schema.Struct({
 const InvalidGrant = Schema.Struct({ error: Schema.Literal("invalid_grant") })
 // Console's 401 when the session behind the access token was revoked or expired.
 const Unauthorized = Schema.Struct({ _tag: Schema.Literal("Unauthorized") })
-// The workspace Library: instructions arrive whole, skills as versions whose files download separately.
-const Library = Schema.Struct({
-  instructions: Schema.Array(Schema.Struct({ id: Schema.String, content: Schema.String })).pipe(Schema.optional),
-  skills: Schema.Array(Schema.Struct({ slug: Schema.String, version: Schema.String })).pipe(Schema.optional),
+// The workspace's instructions arrive whole, its skills as versions whose files download separately.
+const ConsoleInstructions = Schema.Struct({
+  instructions: Schema.Array(Schema.Struct({ id: Schema.String, content: Schema.String })),
 })
-// `library` decodes where it's used, so a malformed one can't fail the config and drop its policies.
-const ConsoleConfig = Schema.Struct({
-  ...ConfigIntegration.Remote.fields,
-  library: Schema.Unknown.pipe(Schema.optional),
+const ConsoleSkills = Schema.Struct({
+  skills: Schema.Array(Schema.Struct({ slug: Schema.String, version: Schema.String })),
 })
 const SkillBundle = Schema.Struct({
   slug: Schema.String,
   files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
 })
-type LibrarySkill = { readonly skill: Skill.Info; readonly files: Record<string, string> }
+type ConsoleSkill = { readonly skill: Skill.Info; readonly files: Record<string, string> }
+// Each list's last ETag and body, so an unchanged list costs a bodyless 304. Kept per cache rather than per module, so
+// runtimes that each build their own cache, such as tests and workerd Durable Objects, never share them.
+const validators = new WeakMap<SharedCache.Interface, Map<string, { readonly etag: string; readonly body: unknown }>>()
 const signedOutMessage = "Reconnect OpenCode Console to continue"
 const ssoMessage = (organization: string | undefined) =>
   `Sign in with SSO again to use ${organization ?? "your OpenCode Console organization"}`
@@ -195,15 +195,18 @@ export const OpencodePlugin = define<
     const scope = yield* Scope.Scope
     const loading = Semaphore.makeUnsafe(1)
     type ActiveConnection = Effect.Success<ReturnType<typeof ctx.integration.connection.active>>
+    const none = { instructions: [], skills: [] } as const
     let snapshot: {
       // The Console's regular OpenCode config, merged as an integration config layer.
-      remote: typeof ConsoleConfig.Type | undefined
+      remote: ConfigIntegration.Remote | undefined
       connection: ActiveConnection
       organization: string | undefined
-    } = { remote: undefined, connection: undefined, organization: undefined }
+      instructions: typeof ConsoleInstructions.Type.instructions
+      skills: typeof ConsoleSkills.Type.skills
+    } = { remote: undefined, connection: undefined, organization: undefined, ...none }
     let instructions: InstructionDiscovery.File[] = []
     // Tagged with the account and workspace they were downloaded for, so a switch hides them right away.
-    let librarySkills: { owner: string; items: LibrarySkill[] } = { owner: "", items: [] }
+    let consoleSkills: { owner: string; items: ConsoleSkill[] } = { owner: "", items: [] }
     const owner = (from: typeof snapshot) =>
       `${IntegrationConnection.key(from.connection) ?? ""}:${from.organization ?? ""}`
     // A newer config's skill download replaces one still in flight.
@@ -217,7 +220,7 @@ export const OpencodePlugin = define<
       const connection = yield* ctx.integration.connection.active("opencode")
       if (!connection) {
         reported = undefined
-        return { remote: undefined, connection, organization: undefined }
+        return { remote: undefined, connection, organization: undefined, ...none }
       }
       const status = (status: IntegrationConnection.Status | undefined) => {
         reported = status
@@ -226,10 +229,16 @@ export const OpencodePlugin = define<
       return yield* ctx.integration.connection.resolve(connection).pipe(
         Effect.flatMap((credential) => {
           if (!credential || credential.type === "external")
-            return Effect.succeed({ remote: undefined, connection, organization: undefined })
+            return Effect.succeed({ remote: undefined, connection, organization: undefined, ...none })
+          const workspace = workspaceKey(connection, credential)
+          // A list that has never loaded counts as empty rather than failing the load, which would drop the config.
+          const list = <A>(key: string, path: string, schema: Schema.Decoder<A>) =>
+            cache
+              .get({ key, interval: maxAge, load: fetchList(http, cache, key, credential, path, schema) })
+              .pipe(Effect.orElseSucceed(() => undefined))
           return cache
             .get({
-              key: `opencode-console:${workspaceKey(connection, credential)}`,
+              key: `opencode-console:${workspace}`,
               interval: maxAge,
               // A sign-in error is Console's answer for this sign-in, so it is shared like a config rather than
               // replaced by the last config, as a network failure is.
@@ -244,8 +253,30 @@ export const OpencodePlugin = define<
               Effect.flatMap((result) =>
                 "failed" in result ? Effect.fail(result.failed) : Effect.succeed(result.remote),
               ),
-              Effect.map((remote) => ({
-                remote,
+              // Instructions and skills are asked for only once the Console accepted this sign-in for its config.
+              Effect.flatMap((remote) =>
+                Effect.gen(function* () {
+                  if (remote === undefined) return { remote, ...none }
+                  const items = yield* Effect.all(
+                    {
+                      instructions: list(
+                        `opencode-console-instructions:${workspace}`,
+                        "/api/v2/instructions",
+                        ConsoleInstructions,
+                      ),
+                      skills: list(`opencode-console-skills:${workspace}`, "/api/v2/skills", ConsoleSkills),
+                    },
+                    { concurrency: 2 },
+                  )
+                  return {
+                    remote,
+                    instructions: items.instructions?.instructions ?? [],
+                    skills: items.skills?.skills ?? [],
+                  }
+                }),
+              ),
+              Effect.map((loaded) => ({
+                ...loaded,
                 connection,
                 organization: organizationName(credential),
               })),
@@ -261,8 +292,8 @@ export const OpencodePlugin = define<
             // A load that fails for the connection already in place keeps its last config: dropping it
             // would lift organization policy while personal credentials keep working.
             return IntegrationConnection.key(connection) === IntegrationConnection.key(snapshot.connection)
-              ? { remote: snapshot.remote, connection, organization: snapshot.organization }
-              : { remote: undefined, connection, organization: undefined }
+              ? { ...snapshot, connection }
+              : { remote: undefined, connection, organization: undefined, ...none }
           }),
         ),
       )
@@ -290,31 +321,28 @@ export const OpencodePlugin = define<
               ? { ...next.connection, id: Credential.ID.make(next.connection.id) }
               : next.connection,
           organization: next.organization,
-          // `make` keeps only the standard config keys, so `library` stays here.
           info: next.remote,
         })
       yield* integrate(document)
-      // Managed `integration.use: deny` makes config layer a policies-only copy, which withholds the Library too.
-      yield* syncLibrary(next, document !== undefined && (!config.integration || integrated === document))
+      // Managed `integration.use: deny` makes config layer a policies-only copy, which withholds instructions and
+      // skills too.
+      yield* syncExtensions(next, document !== undefined && (!config.integration || integrated === document))
     })
-    const syncLibrary = (next: typeof snapshot, allowed: boolean) => {
-      const library = allowed
-        ? Option.getOrUndefined(Schema.decodeUnknownOption(Library)(next.remote?.library))
-        : undefined
-      instructions = (library?.instructions ?? []).map(
+    const syncExtensions = (next: typeof snapshot, allowed: boolean) => {
+      instructions = (allowed ? next.instructions : []).map(
         (item) =>
           new InstructionDiscovery.File({ path: `OpenCode Console instruction ${item.id}`, content: item.content }),
       )
-      if (!allowed) librarySkills = { owner: "", items: [] }
+      if (!allowed) consoleSkills = { owner: "", items: [] }
       // Skills download in the background, so startup and config changes never wait on them. The current ones stay
       // until the download replaces them.
       return FiberHandle.run(
         skillDownload,
-        loadSkills(next.connection, library?.skills ?? []).pipe(
+        loadSkills(next.connection, allowed ? next.skills : []).pipe(
           Effect.flatMap((loaded) => {
             // A failed load keeps the skills already shown.
             if (!loaded) return Effect.void
-            librarySkills = { owner: owner(next), items: loaded }
+            consoleSkills = { owner: owner(next), items: loaded }
             return skills.reload()
           }),
         ),
@@ -450,8 +478,8 @@ export const OpencodePlugin = define<
     })
     yield* discovery.transform((editor) => instructions.forEach((file) => editor.add(file)))
     yield* skills.transform((editor) => {
-      if (librarySkills.owner !== owner(snapshot)) return
-      librarySkills.items.forEach((item) => editor.add(item.skill, item.files))
+      if (consoleSkills.owner !== owner(snapshot)) return
+      consoleSkills.items.forEach((item) => editor.add(item.skill, item.files))
     })
 
     const apply = Effect.fn("OpencodePlugin.apply")(function* (next: typeof snapshot) {
@@ -544,12 +572,61 @@ function fetchConfig(http: HttpClient.HttpClient, value: Credential.Key | Creden
               })
           }
           const body = yield* HttpClientResponse.filterStatusOk(response).pipe(Effect.flatMap((ok) => ok.json))
-          return yield* Schema.decodeUnknownEffect(ConsoleConfig)(body)
+          return yield* Schema.decodeUnknownEffect(ConfigIntegration.Remote)(body)
         }),
       ),
       Effect.scoped,
       // A Console that accepts the connection but never answers would otherwise hold the load, including the one at
       // startup, indefinitely. A timeout is a transient failure, which `SharedCache` retries.
+      Effect.timeout(Duration.seconds(5)),
+    )
+}
+
+// Asks for a workspace list again with the ETag of the last one, which an unchanged list answers with a bodyless 304.
+// `undefined` means the workspace has none for this sign-in; any failure keeps the last list `SharedCache` loaded.
+function fetchList<A>(
+  http: HttpClient.HttpClient,
+  cache: SharedCache.Interface,
+  key: string,
+  value: Credential.Key | Credential.OAuth,
+  path: string,
+  schema: Schema.Decoder<A>,
+) {
+  const known = validators.get(cache) ?? new Map<string, { readonly etag: string; readonly body: unknown }>()
+  validators.set(cache, known)
+  const last = known.get(key)
+  return HttpClient.withScope(http)
+    .execute(
+      HttpClientRequest.get(`${ConsoleAccess.server(value)}${path}`).pipe(
+        HttpClientRequest.acceptJson,
+        HttpClientRequest.setHeaders(ConsoleAccess.headers(value)),
+        HttpClientRequest.setHeaders(last ? { "if-none-match": last.etag } : {}),
+      ),
+    )
+    .pipe(
+      Effect.flatMap((response) =>
+        Effect.gen(function* () {
+          if (response.status === 304 && last) return yield* Schema.decodeUnknownEffect(schema)(last.body)
+          // 404 when the workspace hasn't turned them on, 403 when the sign-in may not read them, such as an API key
+          // without the `skills:use` scope. Only a missing SSO sign-in is an error, which the config reports.
+          const denied =
+            response.status === 403 &&
+            Option.isNone(yield* HttpClientResponse.schemaBodyJson(SsoRequired)(response).pipe(Effect.option))
+          if (response.status === 404 || denied) {
+            known.delete(key)
+            return undefined
+          }
+          const body = yield* HttpClientResponse.filterStatusOk(response).pipe(Effect.flatMap((ok) => ok.json))
+          const decoded = yield* Schema.decodeUnknownEffect(schema)(body)
+          known.delete(key)
+          const etag = response.headers.etag
+          if (etag) known.set(key, { etag, body })
+          // One entry per workspace list, bounded so a long-running process that signs in to many stays small.
+          if (known.size > 64) known.delete(known.keys().next().value ?? key)
+          return decoded
+        }),
+      ),
+      Effect.scoped,
       Effect.timeout(Duration.seconds(5)),
     )
 }
@@ -663,7 +740,7 @@ function downloadSkill(http: HttpClient.HttpClient, server: string, slug: string
     if (!SkillDiscovery.isSafeSegment(slug)) return yield* Effect.fail(new Error(`unsafe skill slug: ${slug}`))
     const bundle = yield* follow(
       http,
-      HttpClientRequest.get(`${server}/api/v2/library/skills/${encodeURIComponent(slug)}`).pipe(
+      HttpClientRequest.get(`${server}/api/v2/skills/${encodeURIComponent(slug)}`).pipe(
         HttpClientRequest.acceptJson,
         HttpClientRequest.setHeaders(headers),
       ),
@@ -680,7 +757,7 @@ function downloadSkill(http: HttpClient.HttpClient, server: string, slug: string
       files: Object.fromEntries(
         bundle.files.filter((file) => file.path !== "SKILL.md").map((file) => [file.path, file.content]),
       ),
-    } satisfies LibrarySkill
+    } satisfies ConsoleSkill
   })
 }
 
