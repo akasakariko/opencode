@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util"
 import { Duration, Effect, Equal, FiberHandle, Option, Schema, Scope, Semaphore, Stream } from "effect"
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import { define } from "@opencode/plugin/effect/plugin"
@@ -308,10 +309,13 @@ export const OpencodePlugin = define<
           entry instanceof ConfigIntegration.Document && entry.integrationID === Integration.ID.make("opencode"),
       )
     })
+    // The document last handed to config. Config keeps the one it holds when handed a deep-equal copy, so handing it
+    // that same object again lets identity tell it apart from the policies-only copy a managed deny layers instead.
+    let published: ConfigIntegration.Document | undefined
     // Policies and providers ride on the snapshot, so a credential switch, disconnect, or 404 replaces them too.
     const publish = Effect.fnUntraced(function* (next: typeof snapshot) {
       // The config merges as one integration document, which config loads right after managed policies.
-      const document =
+      const made =
         next.remote &&
         next.connection &&
         ConfigIntegration.make({
@@ -323,10 +327,11 @@ export const OpencodePlugin = define<
           organization: next.organization,
           info: next.remote,
         })
-      yield* integrate(document)
+      if (!isDeepStrictEqual(published, made)) published = made
+      yield* integrate(published)
       // Managed `integration.use: deny` makes config layer a policies-only copy, which withholds instructions and
       // skills too.
-      yield* syncExtensions(next, document !== undefined && (!config.integration || integrated === document))
+      yield* syncExtensions(next, published !== undefined && (!config.integration || integrated === published))
     })
     const syncExtensions = (next: typeof snapshot, allowed: boolean) => {
       instructions = (allowed ? next.instructions : []).map(

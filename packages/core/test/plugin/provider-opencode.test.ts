@@ -2536,6 +2536,40 @@ describe("OpencodePlugin with Console instructions and skills", () => {
     }),
   )
 
+  for (const changed of ["instructions", "skills"] as const) {
+    it.effect(`keeps them loaded when only the ${changed} change`, () =>
+      Effect.gen(function* () {
+        const fake = extensionsConsole()
+        const discovery = yield* InstructionDiscovery.Service
+        const skills = yield* Skill.Service
+        const loaded = Effect.all([consoleInstructions(discovery), consoleSkills(skills)]).pipe(
+          Effect.map(([instructions, skills]) => ({ instructions, skills: skills.map((skill) => skill.description) })),
+        )
+        yield* signIn()
+        yield* addPlugin().pipe(inProcess(fake))
+        yield* drain
+        expect(yield* loaded).toEqual({ instructions: ["Use tabs."], skills: ["Deploys the service."] })
+
+        // The config stays the same, so config keeps the Console document it already holds.
+        if (changed === "instructions")
+          fake.state.instructions = [{ id: "ins_style", name: "Style", content: "Use spaces." }]
+        if (changed === "skills") {
+          fake.state.skills = [{ slug: "deploy", version: "skl_deploy:2" }]
+          fake.state.bundles.deploy = {
+            slug: "deploy",
+            files: [{ path: "SKILL.md", content: "---\nname: Deploy\ndescription: Deploys it again.\n---\n" }],
+          }
+        }
+        yield* TestClock.adjust("1 minute")
+        yield* drain
+        expect(yield* loaded).toEqual({
+          instructions: [changed === "instructions" ? "Use spaces." : "Use tabs."],
+          skills: [changed === "skills" ? "Deploys it again." : "Deploys the service."],
+        })
+      }),
+    )
+  }
+
   it.effect("treats a 404 or a non-SSO 403 as none, and keeps the last lists while they fail", () =>
     Effect.gen(function* () {
       const fake = extensionsConsole()
@@ -2628,6 +2662,14 @@ describe("OpencodePlugin with Console instructions and skills", () => {
       yield* drain
 
       expect(yield* consolePolicies(config)).toEqual([deny])
+      expect(yield* consoleInstructions(discovery)).toEqual([])
+      expect(yield* consoleSkills(skills)).toEqual([])
+      expect(downloads(fake.requests)).toBe(0)
+
+      fake.state.instructions = [{ id: "ins_style", name: "Style", content: "Use spaces." }]
+      fake.state.skills = [{ slug: "deploy", version: "skl_deploy:2" }]
+      yield* TestClock.adjust("1 minute")
+      yield* drain
       expect(yield* consoleInstructions(discovery)).toEqual([])
       expect(yield* consoleSkills(skills)).toEqual([])
       expect(downloads(fake.requests)).toBe(0)
